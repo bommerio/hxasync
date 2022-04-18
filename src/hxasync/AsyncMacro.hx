@@ -83,20 +83,27 @@ class AsyncMacro {
       }
       switch field.kind {
         case FFun(f):
-          final newF = (asyncContext) ? transformToAsync(f) : f;
-          newF.expr = handleAny(newF.expr, asyncContext);
-          newFields.push({
+          f = (asyncContext) ? transformToAsync(f) : f;
+          final newF:Function = {
+              args: f.args,
+              ret: f.ret,
+              expr: handleAny(f.expr, asyncContext),
+              params: f.params
+          }
+         final newField:Field = {
             name: field.name,
             doc: field.doc,
             access: field.access,
             kind: FFun(newF),
             pos: field.pos,
             meta: field.meta
-          });
+          };
+          newFields.push(newField);
         default:
           if (asyncContext) {
             Context.error("async can be applied only to a function field type", field.pos);
           }
+          newFields.push(field);
       }
     }
     return newFields;
@@ -147,102 +154,119 @@ class AsyncMacro {
 
   public static function handleAny(expr: ReadOnlyExpr, isAsyncContext: Bool):Expr {
     if (expr == null) {
-      return null;
+      Context.fatalError("expr should never be null", Context.currentPos());
     }
-    return switch expr.expr {
+    final newExprDef:ExprDef = switch expr.expr {
       case EReturn(e):
-        handleAny(e, isAsyncContext);
+        if (e == null) {
+          expr.expr;
+        } else {
+          EReturn(handleAny(e, isAsyncContext));
+        }
       case EMeta(s, e):
-        handleEMeta(expr, isAsyncContext);
+        // FIXME: this may not be right
+        handleEMeta(expr, isAsyncContext).expr;
       case EBlock(exprs):
         final newExprs = exprs.map(expr -> handleAny(expr, isAsyncContext));
-        {
-          pos: expr.pos,
-          expr: EBlock(newExprs)
-        }
+        EBlock(newExprs);
       case ECall(e, params):
         final newE = handleAny(e, isAsyncContext);
         final newParams = params.map(param -> handleAny(param, isAsyncContext));
-        {
-          pos: expr.pos,
-          expr: EBlock(newParams)
-        }
+        ECall(e, newParams);
       case EConst(s):
-        null;
+        expr.expr;
       case EField(e, field):
-        handleAny(e, isAsyncContext);
+        EField(handleAny(e, isAsyncContext), field);
       case EVars(vars):
-        final newVars = vars.map(variable -> handleAny(variable.expr, isAsyncContext));
-        {
-          pos: expr.pos,
-          expr: EVars(vars)
-        }
+        final newVars = vars.map(variable ->
+            if (variable.expr != null) {
+              {
+                name: variable.name,
+                type: variable.type,
+                expr: handleAny(variable.expr, isAsyncContext),
+                isFinal: variable.isFinal,
+                meta: variable.meta
+              }
+            } else {
+              variable;
+            }
+        );
+        EVars(newVars);
       case EFunction(kind, f):
-        handleEFunction(f, kind, isAsyncContext, expr.pos);
+        handleEFunction(f, kind, isAsyncContext, expr.pos).expr;
       case EObjectDecl(fields):
         final newFields = fields.map(field -> {
           field: field.field,
           expr: handleAny(field.expr, isAsyncContext),
           quotes: field.quotes
         });
-        {
-          pos: expr.pos,
-          expr: EObjectDecl(newFields)
-        }
+        EObjectDecl(newFields);
       case EParenthesis(e):
-        switch e.expr {
+        final newExpr = switch e.expr {
           case EMeta(s, expr):
             handleEMeta(e, isAsyncContext, true);
           default:
             handleAny(e, isAsyncContext);
         }
+        EParenthesis(newExpr);
       case ECheckType(e, t):
-        handleAny(e, isAsyncContext);
+        ECheckType(handleAny(e, isAsyncContext), t);
       case EIf(econd, eif, eelse):
-        handleAny(econd, isAsyncContext);
-        handleAny(eif, isAsyncContext);
-        handleAny(eelse, isAsyncContext);
+        EIf(
+          handleAny(econd, isAsyncContext),
+          handleAny(eif, isAsyncContext),
+          eelse != null ? handleAny(eelse, isAsyncContext) : null
+        );
       case EBinop(op, e1, e2):
-        handleAny(e1, isAsyncContext);
-        handleAny(e2, isAsyncContext);
+        EBinop(
+          op,
+          handleAny(e1, isAsyncContext),
+          handleAny(e2, isAsyncContext)
+        );
       case EThrow(e):
-        handleAny(e, isAsyncContext);
+        EThrow(handleAny(e, isAsyncContext));
       case ENew(t, params):
         final newParams = params.map(param -> handleAny(param, isAsyncContext));
-        {
-          pos: expr.pos,
-          expr: ENew(t, newParams)
-        }
+        ENew(t, newParams);
       case EArrayDecl(values):
         final newValues = values.map(val -> handleAny(val, isAsyncContext));
-        {
-          pos: expr.pos,
-          expr: EArrayDecl(newValues)
-        }
+        EArrayDecl(newValues);
       case EFor(it, expr):
-        handleAny(it, isAsyncContext);
-        handleAny(expr, isAsyncContext);
+        EFor(
+          handleAny(it, isAsyncContext),
+          handleAny(expr, isAsyncContext)
+        );
       case EArray(e1, e2):
-        handleAny(e1, isAsyncContext);
-        handleAny(e2, isAsyncContext);
+        EArray(
+          handleAny(e1, isAsyncContext),
+          handleAny(e2, isAsyncContext)
+        );
       case EUnop(op, postFix, e):
-        handleAny(e, isAsyncContext);
+        EUnop(op, postFix, handleAny(e, isAsyncContext));
       case ESwitch(e, cases, edef):
-        handleAny(e, isAsyncContext);
-        for (cs in cases) {
-          handleAny(cs.expr, isAsyncContext);
-        }
-        handleAny(edef, isAsyncContext);
+        final newCases:Array<Case> = cases.map(cs -> {
+          // TODO: do we need to worry about adding async/await into value or guard statements?
+          values: cs.values,
+          guard: cs.guard,
+          expr: cs.expr != null ? handleAny(cs.expr, isAsyncContext) : null
+        });
+        ESwitch(
+          handleAny(e, isAsyncContext),
+          newCases,
+          edef != null ? handleAny(edef, isAsyncContext) : null
+        );
       case ECast(e, t):
-        handleAny(e, isAsyncContext);
+        ECast(handleAny(e, isAsyncContext), t);
       case EContinue:
-        null;
+        expr.expr;
       case ETernary(econd, eif, eelse):
-        handleAny(econd, isAsyncContext);
-        handleAny(eif, isAsyncContext);
-        handleAny(eelse, isAsyncContext);
+        ETernary(
+          handleAny(econd, isAsyncContext),
+          handleAny(eif, isAsyncContext),
+          handleAny(eelse, isAsyncContext)
+        );
       case EUntyped(e):
-        handleAny(e, isAsyncContext);
+        EUntyped(handleAny(e, isAsyncContext));
       case ETry(e, catches):
         final newE = handleAny(e, isAsyncContext);
         final newCatches = catches.map(ctch -> {
@@ -250,21 +274,27 @@ class AsyncMacro {
           type: ctch.type,
           expr: handleAny(ctch.expr, isAsyncContext)
         });
-        return {
-          pos: expr.pos,
-          expr: ETry(newE, newCatches)
-        }
+        ETry(newE, newCatches);
       case EWhile(econd, e, normalWhile):
-        handleAny(econd, isAsyncContext);
-        handleAny(e, isAsyncContext);
+        EWhile(
+          handleAny(econd, isAsyncContext),
+          handleAny(e, isAsyncContext),
+          normalWhile
+        );
       case EBreak:
-        null;
+        expr.expr;
       case null:
-        null;
+        expr.expr;
       case other:
         Context.error('Unexpected expression ${other}', expr.pos);
         null;
     }
+
+    final newExpr = {
+      pos: expr.pos,
+      expr: newExprDef
+    }
+    return newExpr;
   }
 
   public static function handleEFunction(
@@ -671,7 +701,7 @@ class AsyncMacro {
             expr: ECall(newE, newParams)
         }
       default:
-          expr.underlying();
+        expr.underlying();
     }
   }
 
