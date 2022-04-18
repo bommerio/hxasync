@@ -1,5 +1,6 @@
 package hxasync;
 
+import haxe.ds.ReadOnlyArray;
 #if macro
 import haxe.macro.Context;
 import haxe.macro.Compiler;
@@ -11,6 +12,49 @@ using haxe.macro.ComplexTypeTools;
 using haxe.macro.ExprTools;
 using hxasync.AsyncMacroUtils;
 
+abstract ReadOnlyFunction(Function) from Function {
+    public var args(get, never):ReadOnlyArray<FunctionArg>;
+	public var ret(get, never):Null<ComplexType>;
+    public var expr(get, never):ReadOnlyExpr;
+	public var params(get, never):ReadOnlyArray<TypeParamDecl>;
+    function get_args() {
+        return this.args;
+    }
+
+    function get_ret() {
+        return this.ret;
+    }
+
+    function get_expr() {
+        return this.expr;
+    }
+
+    function get_params() {
+        return this.params;
+    }
+
+    public function underlying():Function {
+        return this;
+    }
+}
+
+abstract ReadOnlyExpr(Expr) from Expr {
+
+    public var expr(get, never):ExprDef;
+    public var pos(get, never):Position;
+
+    function get_expr() {
+        return this.expr;
+    }
+
+    function get_pos() {
+        return this.pos;
+    }
+
+    public function underlying():Expr {
+        return this;
+    }
+}
 class AsyncMacro {
   public static var callbackRegistered: Bool = false;
   public static var notificationSent: Bool = false;
@@ -27,6 +71,7 @@ class AsyncMacro {
     }
     registerFinishCallback();
     var fields = Context.getBuildFields();
+    final newFields:Array<Field> = [];
     for (field in fields) {
       var meta = field.meta;
       var asyncContext = false;
@@ -38,17 +83,23 @@ class AsyncMacro {
       }
       switch field.kind {
         case FFun(f):
-          if (asyncContext) {
-            transformToAsync(f);
-          }
-          handleAny(f.expr, asyncContext);
+          final newF = (asyncContext) ? transformToAsync(f) : f;
+          newF.expr = handleAny(newF.expr, asyncContext);
+          newFields.push({
+            name: field.name,
+            doc: field.doc,
+            access: field.access,
+            kind: FFun(newF),
+            pos: field.pos,
+            meta: field.meta
+          });
         default:
           if (asyncContext) {
             Context.error("async can be applied only to a function field type", field.pos);
           }
       }
     }
-    return fields;
+    return newFields;
   }
 
   static function makeAsyncable(pathFilter: String) {
@@ -67,11 +118,11 @@ class AsyncMacro {
   }
 
   public static inline function handleEMeta(
-      expr: Expr,
+      expr: ReadOnlyExpr,
       isAsyncContext: Bool,
       addParenthesis: Bool = false
-  ) {
-    switch expr.expr {
+  ):Expr {
+    return switch expr.expr {
       case EMeta(s, e):
         if (s.name == "await") {
           if (!isAsyncContext) {
@@ -81,8 +132,8 @@ class AsyncMacro {
         } else if (s.name == "async") {
           switch e.expr {
             case EFunction(kind, f):
-              transformToAsync(f);
-              handleEFunction(f, kind, true, e.pos);
+              final newF = transformToAsync(f);
+              handleEFunction(newF, kind, true, e.pos);
             default:
               Context.error("async only allowed to be used with functions", e.pos);
           }
@@ -94,7 +145,7 @@ class AsyncMacro {
     }
   }
 
-  public static function handleAny(expr: Expr, isAsyncContext: Bool) {
+  public static function handleAny(expr: ReadOnlyExpr, isAsyncContext: Bool):Expr {
     if (expr == null) {
       return null;
     }
@@ -104,27 +155,39 @@ class AsyncMacro {
       case EMeta(s, e):
         handleEMeta(expr, isAsyncContext);
       case EBlock(exprs):
-        for (expr in exprs) {
-          handleAny(expr, isAsyncContext);
+        final newExprs = exprs.map(expr -> handleAny(expr, isAsyncContext));
+        {
+          pos: expr.pos,
+          expr: EBlock(newExprs)
         }
       case ECall(e, params):
-        handleAny(e, isAsyncContext);
-        for (param in params) {
-          handleAny(param, isAsyncContext);
+        final newE = handleAny(e, isAsyncContext);
+        final newParams = params.map(param -> handleAny(param, isAsyncContext));
+        {
+          pos: expr.pos,
+          expr: EBlock(newParams)
         }
       case EConst(s):
         null;
       case EField(e, field):
         handleAny(e, isAsyncContext);
       case EVars(vars):
-        for (variable in vars) {
-          handleAny(variable.expr, isAsyncContext);
+        final newVars = vars.map(variable -> handleAny(variable.expr, isAsyncContext));
+        {
+          pos: expr.pos,
+          expr: EVars(vars)
         }
       case EFunction(kind, f):
         handleEFunction(f, kind, isAsyncContext, expr.pos);
       case EObjectDecl(fields):
-        for (field in fields) {
-          handleAny(field.expr, isAsyncContext);
+        final newFields = fields.map(field -> {
+          field: field.field,
+          expr: handleAny(field.expr, isAsyncContext),
+          quotes: field.quotes
+        });
+        {
+          pos: expr.pos,
+          expr: EObjectDecl(newFields)
         }
       case EParenthesis(e):
         switch e.expr {
@@ -145,12 +208,16 @@ class AsyncMacro {
       case EThrow(e):
         handleAny(e, isAsyncContext);
       case ENew(t, params):
-        for (param in params) {
-          handleAny(param, isAsyncContext);
+        final newParams = params.map(param -> handleAny(param, isAsyncContext));
+        {
+          pos: expr.pos,
+          expr: ENew(t, newParams)
         }
       case EArrayDecl(values):
-        for (val in values) {
-          handleAny(val, isAsyncContext);
+        final newValues = values.map(val -> handleAny(val, isAsyncContext));
+        {
+          pos: expr.pos,
+          expr: EArrayDecl(newValues)
         }
       case EFor(it, expr):
         handleAny(it, isAsyncContext);
@@ -177,9 +244,15 @@ class AsyncMacro {
       case EUntyped(e):
         handleAny(e, isAsyncContext);
       case ETry(e, catches):
-        handleAny(e, isAsyncContext);
-        for (ctch in catches) {
-          handleAny(ctch.expr, isAsyncContext);
+        final newE = handleAny(e, isAsyncContext);
+        final newCatches = catches.map(ctch -> {
+          name: ctch.name,
+          type: ctch.type,
+          expr: handleAny(ctch.expr, isAsyncContext)
+        });
+        return {
+          pos: expr.pos,
+          expr: ETry(newE, newCatches)
         }
       case EWhile(econd, e, normalWhile):
         handleAny(econd, isAsyncContext);
@@ -199,7 +272,7 @@ class AsyncMacro {
       kind: FunctionKind,
       isAsyncContext: Bool,
       pos: Position
-  ) {
+  ):Expr {
     if (isAsyncContext) {
       switch kind {
         case FNamed(name, inlined):
@@ -213,7 +286,7 @@ class AsyncMacro {
           null;
       }
     }
-    handleAny(fun.expr, isAsyncContext);
+    return handleAny(fun.expr, isAsyncContext);
   }
 
   public static function makeJSAsyncFunctions(content: String): String {
@@ -328,75 +401,87 @@ class AsyncMacro {
     Context.onAfterGenerate(onFinishCallback);
   }
 
-  public static function getModifiedPlatformFunctionBody(e: Expr) {
+  public static function getModifiedPlatformFunctionBody(e: ReadOnlyExpr):Expr {
     return switch Context.definedValue("target.name") {
       case "js":
         macro @:pos(e.pos) {
           std.js.Syntax.code("%asyncPlaceholder%");
-          ${e};
+          ${e.underlying()};
         };
       case "python":
         macro @:pos(e.pos) {
           std.python.Syntax.code("%asyncPlaceholder%");
-          ${e};
+          ${e.underlying()};
         };
       default:
-        e;
+        e.underlying();
     }
   }
 
-  private static function getPythonEmptyReturn(expr: Expr): Expr {
+  private static function getPythonEmptyReturn(pos: Position): Expr {
     return {
       expr: EReturn(
-        macro @:pos(expr.pos) return (std.python.Syntax.code("%noReturnPlaceholder%"))
+        macro @:pos(pos) return (std.python.Syntax.code("%noReturnPlaceholder%"))
       ),
-      pos: expr.pos
+      pos: pos
     };
   }
 
-  private static function getJSEmptyReturn(expr: Expr): Expr {
+  private static function getJSEmptyReturn(pos: Position): Expr {
     return {
       expr: EReturn(
-        macro @:pos(expr.pos) return (std.js.Syntax.code("%noReturnPlaceholder%"))
+        macro @:pos(pos) return (std.js.Syntax.code("%noReturnPlaceholder%"))
       ),
-      pos: expr.pos
+      pos: pos
     };
   }
 
-  public static function getEmptyReturn(expr: Expr): Expr {
+  public static function getEmptyReturn(expr: ReadOnlyExpr): ReadOnlyExpr {
     return switch Context.definedValue("target.name") {
       case "js":
-        getJSEmptyReturn(expr);
+        getJSEmptyReturn(expr.pos);
       case "python":
-        getPythonEmptyReturn(expr);
-      default:
-        expr;
+        getPythonEmptyReturn(expr.pos);
+      case other:
+        Context.error('Unsupported target ${other}', expr.pos);
     }
   }
 
-  public static function makeExplicitReturn(fun: Function) {
-    switch fun.expr.expr {
+  /*
+  public static function makeExplicitReturn(expr: ReadOnlyExpr):Expr {
+    switch expr.expr {
       case EBlock(outerExprs):
         var lastExpr = outerExprs[outerExprs.length - 1];
-        switch lastExpr.expr {
-          case EBlock(exprs):
-            var lastFunctionExpr = exprs[exprs.length - 1];
-            if (lastFunctionExpr == null) {
-              exprs.push(getEmptyReturn(lastExpr));
-              return;
+        if (lastExpr == null) {
+          return {
+            pos: expr.pos,
+            expr: EBlock([getEmptyReturn(expr).underlying()])
+          }
+        }
+        var newLastExpr = makeExplicitReturn(lastExpr);
+        return {
+          pos: expr.pos,
+          expr: EBlock([
+            for (expr in outerExprs) {
+              if (expr == lastExpr) {
+                newLastExpr;
+              } else {
+                expr;
+              }
             }
-            switch lastFunctionExpr.expr {
-              case EReturn(e):
-                return;
-              case EMeta(s, e):
-                exprs.push(getEmptyReturn(lastFunctionExpr));
-              default:
-                exprs.push(getEmptyReturn(lastFunctionExpr));
-            }
-          case EMeta(s, e):
+          ])
+        };
+
+      case EReturn(e):
+        return expr.underlying();
+      case EMeta(s, e):
             if (s.name != ":implicitReturn") {
-              return;
+          exprs.push(getEmptyReturn(lastFunctionExpr));
             }
+      default:
+        exprs.push(getEmptyReturn(lastFunctionExpr));
+    }
+          case EMeta(s, e):
             switch e.expr {
               case EReturn(e):
                 switch e.expr {
@@ -415,14 +500,108 @@ class AsyncMacro {
       default:
         null;
     }
+  }*/
+
+  public static function makeExplicitReturn(expr:ReadOnlyExpr):Expr {
+    return switch expr.expr {
+      case EBlock(outerExprs):
+        var lastExpr = outerExprs[outerExprs.length - 1];
+        switch lastExpr.expr {
+          case EBlock(innerExprs):
+            var lastFunctionExpr = innerExprs[innerExprs.length - 1];
+            if (lastFunctionExpr == null) {
+              final newInnerExprs = innerExprs.copy();
+              newInnerExprs.push(getEmptyReturn(lastExpr).underlying());
+              final newLastExpr = {
+                pos: lastExpr.pos,
+                expr: EBlock(newInnerExprs)
+              }
+              return {
+                pos: expr.pos,
+                expr: EBlock([
+                  for (expr in outerExprs) {
+                    if (expr == lastExpr) {
+                      newLastExpr;
+                    } else {
+                      expr;
+                    }
+                  }
+                ])
+              }
+            }
+            switch lastFunctionExpr.expr {
+              case EReturn(e):
+                return expr.underlying();
+              //case EMeta(s, e):
+               // exprs.push(getEmptyReturn(lastFunctionExpr));
+               // default case
+              default:
+                final newInnerExprs = innerExprs.copy();
+                newInnerExprs.push(getEmptyReturn(lastFunctionExpr).underlying());
+                final newLastExpr = {
+                  pos: lastExpr.pos,
+                  expr: EBlock(newInnerExprs)
+                }
+                return {
+                  pos: expr.pos,
+                  expr: EBlock([
+                    for (expr in outerExprs) {
+                      if (expr == lastExpr) {
+                        newLastExpr;
+                      } else {
+                        expr;
+                      }
+                    }
+                  ])
+                }
+            }
+          case EMeta(s, e):
+            if (s.name != ":implicitReturn") {
+              expr.underlying();
+            }
+            switch e.expr {
+              case EReturn(e):
+                switch e.expr {
+                  case EBlock(returnExprs):
+                    var lastReturnExpr = returnExprs[returnExprs.length - 1];
+                    final newReturnExprs = returnExprs.copy();
+                    newReturnExprs.push(getEmptyReturn(lastReturnExpr).underlying());
+                    final newLastExpr = {
+                      pos: lastExpr.pos,
+                      expr: EBlock(newReturnExprs)
+                    }
+                    return {
+                      pos: expr.pos,
+                      expr: EBlock([
+                        for (expr in outerExprs) {
+                          if (expr == lastExpr) {
+                            newLastExpr;
+                          } else {
+                            expr;
+                          }
+                        }
+                      ])
+                }
+                  default:
+                    expr.underlying();
+                }
+              default:
+                expr.underlying();
+            }
+          default:
+            expr.underlying();
+        }
+      default:
+        expr.underlying();
+    }
   }
 
-  public static function inferReturnType(fun: Function): Null<ComplexType> {
+  public static function inferReturnType(fun: ReadOnlyFunction): Null<ComplexType> {
     if (fun.ret != null) {
       return fun.ret;
     }
     var complexType = try {
-      var typed = Context.typeExpr({expr: EFunction(null, fun), pos: fun.expr.pos});
+      var typed = Context.typeExpr({expr: EFunction(null, fun.underlying()), pos: fun.expr.pos});
       typed.t.followWithAbstracts().toComplexType();
     }
     catch (e) {
@@ -437,7 +616,7 @@ class AsyncMacro {
     }
   }
 
-  public static function getModifiedFunctionReturnType(fun: Function) {
+  public static function getModifiedFunctionReturnType(fun: ReadOnlyFunction) {
     var returnType = inferReturnType(fun);
     return switch returnType {
       case TPath({name: "StdTypes", sub: "Void"}):
@@ -463,35 +642,47 @@ class AsyncMacro {
    * Modifies function body (by adding asyncPlaceholder) and (in future) changes return type from T to Promise<T>
    * @param {Function} fun -- Function to modify
    */
-  public static function transformToAsync(fun: Function) {
+  public static function transformToAsync(fun: ReadOnlyFunction):Function {
+    final newFun: Function = {
+        args: fun.args != null ? fun.args.copy() : null,
+        ret: fun.ret,
+        expr: fun.expr != null ? cast fun.expr : null,
+        params: fun.params != null ? fun.params.copy() : null,
+    }
     if (Context.definedValue("inferTypes") == "1") {
       // Unstable feature
-      fun.ret = getModifiedFunctionReturnType(fun);
+      newFun.ret = getModifiedFunctionReturnType(fun);
     }
-    fun.expr = getModifiedPlatformFunctionBody(fun.expr);
-    makeExplicitReturn(fun);
+    final newExpr = getModifiedPlatformFunctionBody(fun.expr);
+    newFun.expr = makeExplicitReturn(newExpr);
+    return newFun;
   }
 
-  public static function processAwaitedFuncArgs(expr: Expr) {
-    switch expr.expr {
+  public static function processAwaitedFuncArgs(expr: ReadOnlyExpr):Expr {
+    return switch expr.expr {
       case ECall(e, params):
-        handleAny(e, true);
+        final newE = handleAny(e, true);
+        final newParams = [];
         for (param in params) {
-          handleAny(param, false);
+            newParams.push(handleAny(param, false));
+        }
+        return {
+            pos: expr.pos,
+            expr: ECall(newE, newParams)
         }
       default:
-        null;
+          expr.underlying();
     }
   }
 
-  public static function transformToAwait(e: Expr, addParenthesis: Bool) {
-    switch (e.expr) {
+  public static function transformToAwait(e: ReadOnlyExpr, addParenthesis: Bool):Expr {
+    return switch (e.expr) {
       case EMeta(s, metaE):
-        processAwaitedFuncArgs(metaE);
+        final newMetaE = processAwaitedFuncArgs(metaE);
         if (addParenthesis) {
-          e.expr = (macro hxasync.AsyncMacroUtils.awaitWithParenthesis(${metaE})).expr;
+          (macro hxasync.AsyncMacroUtils.awaitWithParenthesis(${newMetaE}));
         } else {
-          e.expr = (macro hxasync.AsyncMacroUtils.await(${metaE})).expr;
+          (macro hxasync.AsyncMacroUtils.await(${newMetaE}));
         }
       default:
         Context.error("Invalid expression", e.pos);
